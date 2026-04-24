@@ -1,0 +1,567 @@
+# ============================================
+# ФАЙЛ: models.py
+# ============================================
+"""
+Модели данных для АИС Burger King
+Содержит классы для представления сущностей системы
+"""
+
+from dataclasses import dataclass
+from typing import List, Dict
+from datetime import datetime
+
+@dataclass
+class MenuItem:
+    """Модель продукта из меню"""
+    id: int
+    name: str
+    price: float
+    
+    def __str__(self):
+        return f"{self.id}. {self.name} - {self.price:.2f} ₽"
+
+@dataclass
+class CartItem:
+    """Модель товара в корзине"""
+    product_id: int
+    name: str
+    price: float
+    quantity: int
+    
+    @property
+    def total(self) -> float:
+        """Общая стоимость позиции"""
+        return self.price * self.quantity
+
+@dataclass
+class Order:
+    """Модель заказа"""
+    id: int
+    user_id: int
+    total_price: float
+    status: str
+    created_at: datetime
+    
+@dataclass
+class User:
+    """Модель пользователя"""
+    id: int
+    username: str
+    password: str
+
+
+# ============================================
+# ФАЙЛ: database.py
+# ============================================
+"""
+Модуль работы с базой данных и бизнес-логики
+Реализует паттерн Repository для доступа к данным
+"""
+
+import sqlite3
+from typing import List, Optional, Dict
+from contextlib import contextmanager
+from models import MenuItem, CartItem, Order, User
+
+class DatabaseManager:
+    """Менеджер подключения к БД с автоматическим закрытием соединения"""
+    
+    def __init__(self, db_path: str = "burgerking.db"):
+        self.db_path = db_path
+    
+    @contextmanager
+    def get_connection(self):
+        """Контекстный менеджер для работы с БД"""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            raise e
+        finally:
+            conn.close()
+
+class MenuRepository:
+    """Репозиторий для работы с меню"""
+    
+    def __init__(self, db_manager: DatabaseManager):
+        self.db = db_manager
+    
+    def get_all_items(self) -> List[MenuItem]:
+        """Получение всего меню"""
+        with self.db.get_connection() as conn:
+            cursor = conn.execute("SELECT id, name, price FROM menu ORDER BY id")
+            return [MenuItem(row['id'], row['name'], row['price']) for row in cursor.fetchall()]
+    
+    def get_item_by_id(self, item_id: int) -> Optional[MenuItem]:
+        """Получение продукта по ID"""
+        with self.db.get_connection() as conn:
+            cursor = conn.execute("SELECT id, name, price FROM menu WHERE id = ?", (item_id,))
+            row = cursor.fetchone()
+            if row:
+                return MenuItem(row['id'], row['name'], row['price'])
+            return None
+
+class OrderRepository:
+    """Репозиторий для работы с заказами"""
+    
+    def __init__(self, db_manager: DatabaseManager):
+        self.db = db_manager
+    
+    def create_order(self, user_id: int, items: List[CartItem]) -> int:
+        """Создание нового заказа и его деталей в транзакции"""
+        total_price = sum(item.total for item in items)
+        
+        with self.db.get_connection() as conn:
+            cursor = conn.execute(
+                "INSERT INTO orders (user_id, total_price, status) VALUES (?, ?, ?)",
+                (user_id, total_price, "Создан")
+            )
+            order_id = cursor.lastrowid
+            
+            for item in items:
+                conn.execute(
+                    "INSERT INTO order_details (order_id, product_id, quantity) VALUES (?, ?, ?)",
+                    (order_id, item.product_id, item.quantity)
+                )
+            
+            return order_id
+    
+    def update_order_status(self, order_id: int, status: str) -> None:
+        """Обновление статуса заказа"""
+        with self.db.get_connection() as conn:
+            conn.execute(
+                "UPDATE orders SET status = ? WHERE id = ?",
+                (status, order_id)
+            )
+    
+    def get_user_orders(self, user_id: int) -> List[Order]:
+        """Получение истории заказов пользователя"""
+        with self.db.get_connection() as conn:
+            cursor = conn.execute(
+                "SELECT id, user_id, total_price, status, created_at FROM orders WHERE user_id = ? ORDER BY created_at DESC",
+                (user_id,)
+            )
+            return [Order(row['id'], row['user_id'], row['total_price'], 
+                         row['status'], row['created_at']) for row in cursor.fetchall()]
+
+class UserRepository:
+    """Репозиторий для работы с пользователями"""
+    
+    def __init__(self, db_manager: DatabaseManager):
+        self.db = db_manager
+    
+    def authenticate(self, username: str, password: str) -> Optional[User]:
+        """Проверка учетных данных пользователя"""
+        with self.db.get_connection() as conn:
+            cursor = conn.execute(
+                "SELECT id, username, password FROM users WHERE username = ? AND password = ?",
+                (username, password)
+            )
+            row = cursor.fetchone()
+            if row:
+                return User(row['id'], row['username'], row['password'])
+            return None
+
+class AISService:
+    """Основной сервис АИС - координация работы репозиториев"""
+    
+    def __init__(self):
+        self.db_manager = DatabaseManager()
+        self.menu_repo = MenuRepository(self.db_manager)
+        self.order_repo = OrderRepository(self.db_manager)
+        self.user_repo = UserRepository(self.db_manager)
+        self.current_user: Optional[User] = None
+    
+    def login(self, username: str, password: str) -> bool:
+        """Аутентификация пользователя"""
+        user = self.user_repo.authenticate(username, password)
+        if user:
+            self.current_user = user
+            return True
+        return False
+    
+    def get_menu(self) -> List[MenuItem]:
+        """Получение текущего меню"""
+        return self.menu_repo.get_all_items()
+    
+    def create_order(self, cart: Dict[int, int]) -> int:
+        """Создание заказа из корзины"""
+        if not self.current_user:
+            raise ValueError("Пользователь не авторизован")
+        
+        cart_items = []
+        for product_id, quantity in cart.items():
+            item = self.menu_repo.get_item_by_id(product_id)
+            if item:
+                cart_items.append(CartItem(item.id, item.name, item.price, quantity))
+            else:
+                raise ValueError(f"Товар с ID {product_id} не найден")
+        
+        if not cart_items:
+            raise ValueError("Корзина пуста")
+        
+        order_id = self.order_repo.create_order(self.current_user.id, cart_items)
+        return order_id
+    
+    def confirm_payment(self, order_id: int) -> bool:
+        """Имитация подтверждения оплаты банком"""
+        print(f"💰 Имитация платежа для заказа #{order_id}...")
+        self.order_repo.update_order_status(order_id, "Оплачено")
+        return True
+    
+    def get_order_history(self) -> List[Order]:
+        """История заказов текущего пользователя"""
+        if not self.current_user:
+            return []
+        return self.order_repo.get_user_orders(self.current_user.id)
+
+
+# ============================================
+# ФАЙЛ: init_db.py
+# ============================================
+"""
+Скрипт инициализации базы данных
+"""
+
+import sqlite3
+
+def init_database():
+    """Инициализация БД: создание таблиц и наполнение тестовыми данными"""
+    
+    conn = sqlite3.connect("burgerking.db")
+    cursor = conn.cursor()
+    
+    # Создание таблиц
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL
+        )
+    """)
+    
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS menu (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            price REAL NOT NULL
+        )
+    """)
+    
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            total_price REAL NOT NULL,
+            status TEXT DEFAULT 'Создан',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    """)
+    
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS order_details (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER NOT NULL,
+            product_id INTEGER NOT NULL,
+            quantity INTEGER NOT NULL,
+            FOREIGN KEY (order_id) REFERENCES orders(id),
+            FOREIGN KEY (product_id) REFERENCES menu(id)
+        )
+    """)
+    
+    # Добавление тестовых пользователей
+    cursor.execute("INSERT OR IGNORE INTO users (username, password) VALUES (?, ?)", ("user1", "pass123"))
+    cursor.execute("INSERT OR IGNORE INTO users (username, password) VALUES (?, ?)", ("user2", "pass456"))
+    
+    # Добавление меню Burger King
+    menu_items = [
+        ("Воппер", 299.00),
+        ("Чизбургер", 89.00),
+        ("Гамбургер", 79.00),
+        ("Воппер Джуниор", 199.00),
+        ("Двойной Воппер", 399.00),
+        ("Картофель Фри", 99.00),
+        ("Наггетсы (6 шт.)", 149.00),
+        ("Чикен Ролл", 169.00),
+        ("Кока-Кола 0.5", 89.00),
+        ("Мороженое", 59.00)
+    ]
+    
+    for name, price in menu_items:
+        cursor.execute("INSERT OR IGNORE INTO menu (name, price) VALUES (?, ?)", (name, price))
+    
+    conn.commit()
+    conn.close()
+    print("✅ База данных успешно инициализирована!")
+    print("📊 Тестовые пользователи: user1/pass123, user2/pass456")
+    print("🍔 Добавлено 10 позиций меню")
+
+if __name__ == "__main__":
+    init_database()
+
+
+# ============================================
+# ФАЙЛ: main.py
+# ============================================
+"""
+Главный модуль АИС Burger King - CLI интерфейс
+"""
+
+from database import AISService
+from models import MenuItem, CartItem
+from typing import Dict
+
+class BurgerKingCLI:
+    """Консольный интерфейс для работы с АИС"""
+    
+    def __init__(self):
+        self.service = AISService()
+        self.cart: Dict[int, int] = {}
+    
+    def clear_screen(self):
+        """Очистка экрана"""
+        print("\n" * 2)
+    
+    def show_header(self, title: str):
+        """Отображение заголовка"""
+        print("=" * 50)
+        print(f"🍔 BURGER KING АИС - {title}")
+        print("=" * 50)
+    
+    def show_menu(self):
+        """Отображение доступных бургеров"""
+        self.show_header("НАШЕ МЕНЮ")
+        items = self.service.get_menu()
+        
+        if not items:
+            print("⚠️ Меню временно недоступно")
+            return
+        
+        print(f"{'ID':<4} {'Название':<25} {'Цена':<10}")
+        print("-" * 40)
+        for item in items:
+            print(f"{item.id:<4} {item.name:<25} {item.price:.2f} ₽")
+        print("-" * 40)
+    
+    def show_cart(self):
+        """Отображение содержимого корзины"""
+        self.show_header("КОРЗИНА")
+        
+        if not self.cart:
+            print("🛒 Корзина пуста")
+            return
+        
+        total = 0
+        print(f"{'Товар':<25} {'Кол-во':<8} {'Цена':<10} {'Сумма':<10}")
+        print("-" * 55)
+        
+        for product_id, quantity in self.cart.items():
+            item = self.service.menu_repo.get_item_by_id(product_id)
+            if item:
+                subtotal = item.price * quantity
+                total += subtotal
+                print(f"{item.name:<25} {quantity:<8} {item.price:.2f} ₽   {subtotal:.2f} ₽")
+        
+        print("-" * 55)
+        print(f"ИТОГО: {total:.2f} ₽")
+    
+    def add_to_cart(self):
+        """Добавление товара в корзину"""
+        self.show_menu()
+        
+        try:
+            product_id = int(input("\n🔢 Введите ID товара: "))
+            quantity = int(input("🔢 Введите количество: "))
+            
+            if quantity <= 0:
+                print("❌ Количество должно быть положительным")
+                return
+            
+            item = self.service.menu_repo.get_item_by_id(product_id)
+            if not item:
+                print("❌ Товар не найден")
+                return
+            
+            if product_id in self.cart:
+                self.cart[product_id] += quantity
+            else:
+                self.cart[product_id] = quantity
+            
+            print(f"✅ {quantity}x {item.name} добавлен(ы) в корзину")
+            
+        except ValueError:
+            print("❌ Ошибка: введите корректное число")
+    
+    def checkout(self):
+        """Оформление заказа и имитация оплаты"""
+        self.show_cart()
+        
+        if not self.cart:
+            print("\n❌ Нельзя оформить пустой заказ")
+            return
+        
+        print("\n📋 Оформление заказа...")
+        
+        try:
+            order_id = self.service.create_order(self.cart)
+            print(f"✅ Заказ #{order_id} создан в системе")
+            
+            print("🏦 Запрос к платежному шлюзу...")
+            if self.service.confirm_payment(order_id):
+                print("✅ Оплата подтверждена банком")
+                print(f"🎉 Заказ #{order_id} успешно оформлен и оплачен!")
+                self.cart.clear()
+            else:
+                print("❌ Ошибка оплаты")
+                
+        except ValueError as e:
+            print(f"❌ Ошибка: {e}")
+        except Exception as e:
+            print(f"❌ Непредвиденная ошибка: {e}")
+    
+    def show_order_history(self):
+        """Просмотр истории заказов"""
+        self.show_header("ИСТОРИЯ ЗАКАЗОВ")
+        
+        orders = self.service.get_order_history()
+        
+        if not orders:
+            print("📭 У вас пока нет заказов")
+            return
+        
+        for order in orders:
+            status_icon = "✅" if order.status == "Оплачено" else "🕐"
+            print(f"{status_icon} Заказ #{order.id} | {order.total_price:.2f} ₽ | {order.status} | {order.created_at}")
+    
+    def run(self):
+        """Главный цикл приложения"""
+        self.clear_screen()
+        self.show_header("АВТОРИЗАЦИЯ")
+        
+        login_attempts = 0
+        while login_attempts < 3:
+            username = input("👤 Логин: ")
+            password = input("🔐 Пароль: ")
+            
+            if self.service.login(username, password):
+                print(f"\n✅ Добро пожаловать, {username}!")
+                break
+            else:
+                login_attempts += 1
+                print(f"❌ Неверный логин или пароль. Осталось попыток: {3 - login_attempts}")
+        
+        if not self.service.current_user:
+            print("❌ Превышено количество попыток входа. Доступ закрыт.")
+            return
+        
+        while True:
+            self.clear_screen()
+            self.show_header("ГЛАВНОЕ МЕНЮ")
+            print("\n1️⃣  Показать меню")
+            print("2️⃣  Добавить в корзину")
+            print("3️⃣  Посмотреть корзину")
+            print("4️⃣  Оформить заказ")
+            print("5️⃣  История заказов")
+            print("0️⃣  Выход")
+            
+            choice = input("\n🔢 Выберите действие: ")
+            
+            if choice == "1":
+                self.clear_screen()
+                self.show_menu()
+                input("\nНажмите Enter для продолжения...")
+            
+            elif choice == "2":
+                self.clear_screen()
+                self.add_to_cart()
+                input("\nНажмите Enter для продолжения...")
+            
+            elif choice == "3":
+                self.clear_screen()
+                self.show_cart()
+                input("\nНажмите Enter для продолжения...")
+            
+            elif choice == "4":
+                self.clear_screen()
+                self.checkout()
+                input("\nНажмите Enter для продолжения...")
+            
+            elif choice == "5":
+                self.clear_screen()
+                self.show_order_history()
+                input("\nНажмите Enter для продолжения...")
+            
+            elif choice == "0":
+                print("\n👋 Спасибо за использование АИС Burger King! До свидания!")
+                break
+            
+            else:
+                print("❌ Неверный выбор")
+                input("Нажмите Enter для продолжения...")
+
+if __name__ == "__main__":
+    app = BurgerKingCLI()
+    app.run()
+
+
+# ============================================
+# ФАЙЛ: requirements.txt
+# ============================================
+# Зависимости проекта
+# Для работы достаточно стандартной библиотеки Python
+# Дополнительные пакеты не требуются
+
+
+# ============================================
+# ФАЙЛ: README.md
+# ============================================
+"""
+# 🍔 АИС Burger King - Автоматизированная Информационная Система заказа еды
+
+## 📋 Описание системы
+
+Автоматизированная Информационная Система (АИС) для сети ресторанов Burger King, 
+позволяющая пользователям просматривать меню, формировать заказы и оплачивать их 
+с автоматической фиксацией в базе данных.
+
+## 🏗️ Архитектура
+
+Проект реализован по **клиент-серверной архитектуре**:
+- **Клиентская часть** (`main.py`): CLI интерфейс пользователя
+- **Серверная логика** (`database.py`): Бизнес-логика и работа с БД
+- **Модели данных** (`models.py`): Классы для представления сущностей
+- **База данных**: SQLite (реляционная СУБД)
+
+## 💡 Чем АИС отличается от "обычной" системы?
+
+### Обычная система (ручной ввод кассиром):
+1. Кассир слушает заказ
+2. Ручной ввод каждого товара
+3. Расчет на калькуляторе
+4. Риск ошибок при вводе
+5. Нет единой базы данных
+6. Нет истории заказов
+7. Ручное изменение статусов
+
+### Наша АИС (автоматизированная):
+1. Пользователь выбирает товары из меню
+2. Система автоматически сохраняет заказ в БД
+3. SQL транзакция: INSERT INTO orders + INSERT INTO order_details
+4. Автоматический расчет суммы
+5. Изменение статуса через UPDATE
+6. Полная история заказов
+7. Автоматическая фиксация каждой операции
+
+**Ключевое отличие**: Автоматическая фиксация данных через SQL-транзакции, 
+исключающая человеческий фактор и обеспечивающая целостность данных.
+
+## 🚀 Установка и запуск
+
+### 1. Клонирование репозитория
+```bash
+git clone https://github.com/yourusername/burgerking-ais.git
+cd burgerking-ais
